@@ -60,20 +60,37 @@ function verifyShopifyWebhook(data, hmacHeader) {
  * Check if order is a pickup order based on shipping lines
  */
 function isPickupOrder(order) {
+  console.log('\n🔍 Checking if pickup order...');
+  console.log('   Full order data (shipping_lines):');
+  console.log(JSON.stringify(order.shipping_lines, null, 2));
+  
   if (!order.shipping_lines || order.shipping_lines.length === 0) {
+    console.log('   ❌ No shipping lines found');
     return false;
   }
 
-  return order.shipping_lines.some(line => {
+  const isPickup = order.shipping_lines.some(line => {
     const code = (line.code || '').toLowerCase();
     const title = (line.title || '').toLowerCase();
     const source = (line.source || '').toLowerCase();
 
-    return code.includes('pickup') || 
-           title.includes('pickup') || 
-           title.includes('pick up') ||
-           code.includes('local');
+    console.log(`\n   Checking shipping line:`);
+    console.log(`   - code: "${code}"`);
+    console.log(`   - title: "${title}"`);
+    console.log(`   - source: "${source}"`);
+
+    const hasPickup = code.includes('pickup') || 
+                      title.includes('pickup') || 
+                      title.includes('pick up') ||
+                      code.includes('local');
+
+    console.log(`   - Contains pickup keywords: ${hasPickup}`);
+
+    return hasPickup;
   });
+
+  console.log(`\n   ✓ Final result: ${isPickup ? 'IS PICKUP' : 'NOT PICKUP'}\n`);
+  return isPickup;
 }
 
 /**
@@ -200,6 +217,14 @@ app.post('/webhooks/orders/create', async (req, res) => {
       processed: false 
     });
   }
+});
+
+/**
+ * Ignore cart webhooks
+ */
+app.post('/webhooks/carts/create', async (req, res) => {
+  console.log('🛒 Cart webhook received - ignoring');
+  res.status(200).json({ message: 'Cart webhook ignored' });
 });
 
 /**
