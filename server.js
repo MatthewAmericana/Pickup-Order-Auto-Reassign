@@ -57,40 +57,52 @@ function verifyShopifyWebhook(data, hmacHeader) {
 }
 
 /**
- * Check if order is a pickup order based on shipping lines
+ * Check if order is a pickup order based on tags or shipping lines
  */
 function isPickupOrder(order) {
   console.log('\n🔍 Checking if pickup order...');
-  console.log('   Full order data (shipping_lines):');
-  console.log(JSON.stringify(order.shipping_lines, null, 2));
   
-  if (!order.shipping_lines || order.shipping_lines.length === 0) {
-    console.log('   ❌ No shipping lines found');
-    return false;
+  // Method 1: Check tags (preferred method with Shopify Flow)
+  if (order.tags) {
+    const tags = order.tags.toLowerCase();
+    console.log(`   Order tags: "${order.tags}"`);
+    
+    if (tags.includes('pickup-order') || tags.includes('pickup')) {
+      console.log('   ✓ Pickup detected via tags');
+      return true;
+    }
   }
-
-  const isPickup = order.shipping_lines.some(line => {
-    const code = (line.code || '').toLowerCase();
-    const title = (line.title || '').toLowerCase();
-    const source = (line.source || '').toLowerCase();
-
-    console.log(`\n   Checking shipping line:`);
-    console.log(`   - code: "${code}"`);
-    console.log(`   - title: "${title}"`);
-    console.log(`   - source: "${source}"`);
-
-    const hasPickup = code.includes('pickup') || 
-                      title.includes('pickup') || 
-                      title.includes('pick up') ||
-                      code.includes('local');
-
-    console.log(`   - Contains pickup keywords: ${hasPickup}`);
-
-    return hasPickup;
-  });
-
-  console.log(`\n   ✓ Final result: ${isPickup ? 'IS PICKUP' : 'NOT PICKUP'}\n`);
-  return isPickup;
+  
+  // Method 2: Check shipping line title/code
+  if (order.shipping_lines && order.shipping_lines.length > 0) {
+    console.log('   Checking shipping lines...');
+    
+    for (const line of order.shipping_lines) {
+      const code = (line.code || '').toLowerCase();
+      const title = (line.title || '').toLowerCase();
+      
+      console.log(`   - Shipping: "${title}" (code: "${code}")`);
+      
+      // Check if it's Genesis Impact Sports (your pickup location)
+      if (title.includes('genesis impact sports') || 
+          code.includes('genesis impact sports')) {
+        console.log('   ✓ Pickup detected via Genesis Impact Sports shipping line');
+        return true;
+      }
+      
+      // Generic pickup detection
+      if (code.includes('pickup') || 
+          title.includes('pickup') || 
+          title.includes('pick up') ||
+          code.includes('local')) {
+        console.log('   ✓ Pickup detected via generic keywords');
+        return true;
+      }
+    }
+  }
+  
+  console.log('   ✗ Not a pickup order\n');
+  return false;
 }
 
 /**
@@ -130,10 +142,10 @@ app.post('/webhooks/orders/create', async (req, res) => {
       });
     }
 
-    console.log('✓ Pickup order detected');
+    console.log('✓✓✓ PICKUP ORDER DETECTED ✓✓✓');
 
-    // Format order ID for SkuSavvy (remove # prefix)
-    const skuSavvyOrderId = order.name.replace('#', ''); 
+    // Format order ID for SkuSavvy
+    const skuSavvyOrderId = order.name.replace('#APA', '').replace('#', '');
     console.log(`   SkuSavvy Order ID: ${skuSavvyOrderId}`);
 
     // Small delay to ensure order syncs to SkuSavvy
