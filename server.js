@@ -17,7 +17,7 @@ const skuSavvyClient = new GraphQLClient(process.env.SKUSAVVY_GRAPHQL_ENDPOINT, 
   },
 });
 
-// GraphQL mutation to reassign warehouse
+// GraphQL mutation to reassign warehouse - FIXED
 const REASSIGN_MUTATION = `
   mutation ReassignGenesisToAmericana($orderId: UUID!, $shipmentId: Int!) {
     shipmentReassignLocation(
@@ -33,10 +33,10 @@ const REASSIGN_MUTATION = `
   }
 `;
 
-// GraphQL query to get order and shipment details
+// GraphQL query to get order and shipment details - FIXED
 const GET_ORDER_QUERY = `
-  query GetOrder($orderId: String!) {
-    order(orderId: $orderId) {
+  query GetOrder($orderId: UUID!) {
+    customerOrder(id: $orderId) {
       id
       shipments {
         id
@@ -156,27 +156,62 @@ app.post('/webhooks/orders/create', async (req, res) => {
 
     console.log('✓✓✓ PICKUP ORDER DETECTED ✓✓✓');
 
-    // Format order ID for SkuSavvy
-    const skuSavvyOrderId = order.name.replace('#APA', '').replace('#', '');
-    console.log(`   SkuSavvy Order ID: ${skuSavvyOrderId}`);
+    // Format order ID for SkuSavvy - need to find the UUID
+    const skuSavvyOrderNumber = order.name.replace('#APA', '').replace('#', '');
+    console.log(`   Shopify Order Number: ${skuSavvyOrderNumber}`);
 
     // Small delay to ensure order syncs to SkuSavvy
     console.log('⏳ Waiting 10 seconds for order sync...');
     await new Promise(resolve => setTimeout(resolve, 10000));
 
-    // Query SkuSavvy for order details
-    console.log('🔍 Querying SkuSavvy for order details...');
-    console.log(`   Endpoint: ${process.env.SKUSAVVY_GRAPHQL_ENDPOINT}`);
-    console.log(`   Order ID to query: ${skuSavvyOrderId}`);
+    // First, we need to find the order by order number to get its UUID
+    console.log('🔍 Finding order UUID in SkuSavvy...');
+    
+    const FIND_ORDER_QUERY = `
+      query FindOrder {
+        customerOrders(first: 50, orderBy: { direction: DESC, field: CREATED_AT }) {
+          edges {
+            node {
+              id
+              orderNumber
+              shopifyOrderNumber
+              shipments {
+                id
+                warehouseId
+                status
+              }
+            }
+          }
+        }
+      }
+    `;
     
     let orderData;
     try {
-      orderData = await skuSavvyClient.request(GET_ORDER_QUERY, {
-        orderId: skuSavvyOrderId
+      const result = await skuSavvyClient.request(FIND_ORDER_QUERY);
+      
+      console.log('✓ Retrieved recent orders from SkuSavvy');
+      
+      // Find the matching order
+      const matchingOrder = result.customerOrders.edges.find(edge => {
+        const node = edge.node;
+        return node.orderNumber === skuSavvyOrderNumber || 
+               node.shopifyOrderNumber === skuSavvyOrderNumber ||
+               node.shopifyOrderNumber === order.name;
       });
       
-      console.log('✓ SkuSavvy response received');
-      console.log('   Order data:', JSON.stringify(orderData, null, 2));
+      if (!matchingOrder) {
+        console.log('ℹ️  Order not found in SkuSavvy yet - may need to retry later\n');
+        console.log('   Searched for:', skuSavvyOrderNumber);
+        return res.status(200).json({ 
+          message: 'Order not synced to SkuSavvy yet',
+          processed: false,
+          note: 'Order may take a few minutes to sync from Shopify to SkuSavvy'
+        });
+      }
+      
+      orderData = matchingOrder.node;
+      console.log(`✓ Found order with UUID: ${orderData.id}`);
       
     } catch (error) {
       console.error('❌ Error querying SkuSavvy:', error.message);
@@ -186,32 +221,10 @@ app.post('/webhooks/orders/create', async (req, res) => {
         console.error('   Response errors:', JSON.stringify(error.response.errors, null, 2));
       }
       
-      // Network error
-      if (error.code === 'ENOTFOUND') {
-        console.error('\n❌ SkuSavvy API endpoint not found!');
-        console.error('   Current endpoint:', process.env.SKUSAVVY_GRAPHQL_ENDPOINT);
-        console.error('   Please verify the correct SkuSavvy API endpoint in your environment variables.\n');
-        return res.status(200).json({ 
-          error: 'SkuSavvy API endpoint not found',
-          endpoint: process.env.SKUSAVVY_GRAPHQL_ENDPOINT,
-          processed: false 
-        });
-      }
-      
-      // Order might not be synced yet
-      if (error.message.includes('not found') || error.message.includes('null')) {
-        console.log('ℹ️  Order not found in SkuSavvy yet - may need to retry later\n');
-        return res.status(200).json({ 
-          message: 'Order not synced to SkuSavvy yet',
-          processed: false,
-          note: 'Order may take a few minutes to sync from Shopify to SkuSavvy'
-        });
-      }
-      
       throw error;
     }
 
-    if (!orderData.order || !orderData.order.shipments?.length) {
+    if (!orderData.shipments || !orderData.shipments.length) {
       console.log('ℹ️  No shipments found in SkuSavvy yet\n');
       return res.status(200).json({ 
         message: 'No shipments to reassign',
@@ -219,12 +232,12 @@ app.post('/webhooks/orders/create', async (req, res) => {
       });
     }
 
-    console.log(`✓ Found ${orderData.order.shipments.length} shipment(s)`);
+    console.log(`✓ Found ${orderData.shipments.length} shipment(s)`);
 
     // Reassign each shipment to Americana warehouse
     let reassignedCount = 0;
     
-    for (const shipment of orderData.order.shipments) {
+    for (const shipment of orderData.shipments) {
       console.log(`\n   Shipment ${shipment.id}:`);
       console.log(`   - Current warehouse: ${shipment.warehouseId}`);
       console.log(`   - Status: ${shipment.status}`);
@@ -238,11 +251,11 @@ app.post('/webhooks/orders/create', async (req, res) => {
 
       try {
         const result = await skuSavvyClient.request(REASSIGN_MUTATION, {
-          orderId: orderData.order.id,
+          orderId: orderData.id,
           shipmentId: parseInt(shipment.id),
         });
 
-        console.log('   ✓ Successfully reassigned');
+        console.log('   ✓ Successfully reassigned to Americana!');
         console.log('   Result:', JSON.stringify(result, null, 2));
         reassignedCount++;
       } catch (error) {
@@ -253,7 +266,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
       }
     }
 
-    console.log(`\n✅ Completed: ${reassignedCount} shipment(s) reassigned to Americana\n`);
+    console.log(`\n✅✅✅ SUCCESS! ${reassignedCount} shipment(s) reassigned to Americana ✅✅✅\n`);
 
     res.status(200).json({ 
       success: true,
