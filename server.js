@@ -17,7 +17,7 @@ const skuSavvyClient = new GraphQLClient(process.env.SKUSAVVY_GRAPHQL_ENDPOINT, 
   },
 });
 
-// GraphQL mutation to reassign warehouse - FIXED
+// GraphQL mutation to reassign warehouse
 const REASSIGN_MUTATION = `
   mutation ReassignGenesisToAmericana($orderId: UUID!, $shipmentId: Int!) {
     shipmentReassignLocation(
@@ -28,20 +28,6 @@ const REASSIGN_MUTATION = `
       shipments { 
         id 
         warehouseId
-      }
-    }
-  }
-`;
-
-// GraphQL query to get order and shipment details - FIXED
-const GET_ORDER_QUERY = `
-  query GetOrder($orderId: UUID!) {
-    customerOrder(id: $orderId) {
-      id
-      shipments {
-        id
-        warehouseId
-        status
       }
     }
   }
@@ -156,7 +142,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
 
     console.log('✓✓✓ PICKUP ORDER DETECTED ✓✓✓');
 
-    // Format order ID for SkuSavvy - need to find the UUID
+    // Format order ID for SkuSavvy
     const skuSavvyOrderNumber = order.name.replace('#APA', '').replace('#', '');
     console.log(`   Shopify Order Number: ${skuSavvyOrderNumber}`);
 
@@ -164,12 +150,12 @@ app.post('/webhooks/orders/create', async (req, res) => {
     console.log('⏳ Waiting 10 seconds for order sync...');
     await new Promise(resolve => setTimeout(resolve, 10000));
 
-    // First, we need to find the order by order number to get its UUID
+    // Find the order in SkuSavvy by order number
     console.log('🔍 Finding order UUID in SkuSavvy...');
     
     const FIND_ORDER_QUERY = `
       query FindOrder {
-        customerOrders(first: 50, orderBy: { direction: DESC, field: CREATED_AT }) {
+        outboundOrders(first: 50, orderBy: { direction: DESC, field: CREATED_AT }) {
           edges {
             node {
               id
@@ -191,18 +177,31 @@ app.post('/webhooks/orders/create', async (req, res) => {
       const result = await skuSavvyClient.request(FIND_ORDER_QUERY);
       
       console.log('✓ Retrieved recent orders from SkuSavvy');
+      console.log(`   Found ${result.outboundOrders.edges.length} recent orders`);
       
       // Find the matching order
-      const matchingOrder = result.customerOrders.edges.find(edge => {
+      const matchingOrder = result.outboundOrders.edges.find(edge => {
         const node = edge.node;
-        return node.orderNumber === skuSavvyOrderNumber || 
+        const matches = node.orderNumber === skuSavvyOrderNumber || 
                node.shopifyOrderNumber === skuSavvyOrderNumber ||
-               node.shopifyOrderNumber === order.name;
+               node.shopifyOrderNumber === order.name ||
+               node.orderNumber === order.name;
+        
+        if (matches) {
+          console.log(`   ✓ Found matching order: ${node.orderNumber} (UUID: ${node.id})`);
+        }
+        
+        return matches;
       });
       
       if (!matchingOrder) {
-        console.log('ℹ️  Order not found in SkuSavvy yet - may need to retry later\n');
-        console.log('   Searched for:', skuSavvyOrderNumber);
+        console.log('ℹ️  Order not found in SkuSavvy yet\n');
+        console.log('   Searched for:', skuSavvyOrderNumber, 'or', order.name);
+        console.log('   Recent orders in SkuSavvy:');
+        result.outboundOrders.edges.slice(0, 5).forEach(edge => {
+          console.log(`     - ${edge.node.orderNumber} (Shopify: ${edge.node.shopifyOrderNumber})`);
+        });
+        
         return res.status(200).json({ 
           message: 'Order not synced to SkuSavvy yet',
           processed: false,
@@ -225,7 +224,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
     }
 
     if (!orderData.shipments || !orderData.shipments.length) {
-      console.log('ℹ️  No shipments found in SkuSavvy yet\n');
+      console.log('ℹ️  No shipments found in order\n');
       return res.status(200).json({ 
         message: 'No shipments to reassign',
         processed: false 
@@ -238,16 +237,16 @@ app.post('/webhooks/orders/create', async (req, res) => {
     let reassignedCount = 0;
     
     for (const shipment of orderData.shipments) {
-      console.log(`\n   Shipment ${shipment.id}:`);
-      console.log(`   - Current warehouse: ${shipment.warehouseId}`);
-      console.log(`   - Status: ${shipment.status}`);
+      console.log(`\n   📦 Shipment ${shipment.id}:`);
+      console.log(`      Current warehouse: ${shipment.warehouseId}`);
+      console.log(`      Status: ${shipment.status}`);
 
       if (shipment.warehouseId === process.env.AMERICANA_WAREHOUSE_ID) {
-        console.log('   ✓ Already assigned to Americana');
+        console.log('      ✓ Already assigned to Americana');
         continue;
       }
 
-      console.log('   → Reassigning to Americana...');
+      console.log('      → Reassigning to Americana...');
 
       try {
         const result = await skuSavvyClient.request(REASSIGN_MUTATION, {
@@ -255,18 +254,17 @@ app.post('/webhooks/orders/create', async (req, res) => {
           shipmentId: parseInt(shipment.id),
         });
 
-        console.log('   ✓ Successfully reassigned to Americana!');
-        console.log('   Result:', JSON.stringify(result, null, 2));
+        console.log('      ✅ Successfully reassigned to Americana!');
         reassignedCount++;
       } catch (error) {
-        console.error('   ❌ Error reassigning shipment:', error.message);
+        console.error('      ❌ Error reassigning shipment:', error.message);
         if (error.response) {
-          console.error('   Response errors:', JSON.stringify(error.response.errors, null, 2));
+          console.error('      Response errors:', JSON.stringify(error.response.errors, null, 2));
         }
       }
     }
 
-    console.log(`\n✅✅✅ SUCCESS! ${reassignedCount} shipment(s) reassigned to Americana ✅✅✅\n`);
+    console.log(`\n🎉🎉🎉 SUCCESS! ${reassignedCount} shipment(s) reassigned to Americana 🎉🎉🎉\n`);
 
     res.status(200).json({ 
       success: true,
