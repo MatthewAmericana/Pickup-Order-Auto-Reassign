@@ -33,6 +33,25 @@ const REASSIGN_MUTATION = `
   }
 `;
 
+// GraphQL query to find order by number
+const FIND_ORDER_QUERY = `
+  query GetSkuSavvyOrderId($apaOrderNumber: String!) {
+    orders(id: $apaOrderNumber, limit: 1) {
+      __typename
+      ... on CustomerOrder {
+        id
+        orderNumber
+        shopifyOrderNumber
+        shipments {
+          id
+          warehouseId
+          status
+        }
+      }
+    }
+  }
+`;
+
 /**
  * Verify that webhook request is from Shopify
  */
@@ -142,65 +161,28 @@ app.post('/webhooks/orders/create', async (req, res) => {
 
     console.log('✓✓✓ PICKUP ORDER DETECTED ✓✓✓');
 
-    // Format order ID for SkuSavvy
-    const skuSavvyOrderNumber = order.name.replace('#APA', '').replace('#', '');
-    console.log(`   Shopify Order Number: ${skuSavvyOrderNumber}`);
+    // Format order number for SkuSavvy query (keep the APA prefix)
+    const apaOrderNumber = order.name.replace('#', ''); // "APA411275"
+    console.log(`   APA Order Number: ${apaOrderNumber}`);
 
     // Small delay to ensure order syncs to SkuSavvy
     console.log('⏳ Waiting 10 seconds for order sync...');
     await new Promise(resolve => setTimeout(resolve, 10000));
 
-    // Find the order in SkuSavvy by order number
-    console.log('🔍 Finding order UUID in SkuSavvy...');
-    
-    const FIND_ORDER_QUERY = `
-      query FindOrder {
-        outboundOrders(first: 50, orderBy: { direction: DESC, field: CREATED_AT }) {
-          edges {
-            node {
-              id
-              orderNumber
-              shopifyOrderNumber
-              shipments {
-                id
-                warehouseId
-                status
-              }
-            }
-          }
-        }
-      }
-    `;
+    // Find the order in SkuSavvy
+    console.log('🔍 Querying SkuSavvy for order...');
     
     let orderData;
     try {
-      const result = await skuSavvyClient.request(FIND_ORDER_QUERY);
-      
-      console.log('✓ Retrieved recent orders from SkuSavvy');
-      console.log(`   Found ${result.outboundOrders.edges.length} recent orders`);
-      
-      // Find the matching order
-      const matchingOrder = result.outboundOrders.edges.find(edge => {
-        const node = edge.node;
-        const matches = node.orderNumber === skuSavvyOrderNumber || 
-               node.shopifyOrderNumber === skuSavvyOrderNumber ||
-               node.shopifyOrderNumber === order.name ||
-               node.orderNumber === order.name;
-        
-        if (matches) {
-          console.log(`   ✓ Found matching order: ${node.orderNumber} (UUID: ${node.id})`);
-        }
-        
-        return matches;
+      const result = await skuSavvyClient.request(FIND_ORDER_QUERY, {
+        apaOrderNumber: apaOrderNumber
       });
       
-      if (!matchingOrder) {
+      console.log('✓ SkuSavvy query successful');
+      
+      if (!result.orders || result.orders.length === 0) {
         console.log('ℹ️  Order not found in SkuSavvy yet\n');
-        console.log('   Searched for:', skuSavvyOrderNumber, 'or', order.name);
-        console.log('   Recent orders in SkuSavvy:');
-        result.outboundOrders.edges.slice(0, 5).forEach(edge => {
-          console.log(`     - ${edge.node.orderNumber} (Shopify: ${edge.node.shopifyOrderNumber})`);
-        });
+        console.log('   Searched for:', apaOrderNumber);
         
         return res.status(200).json({ 
           message: 'Order not synced to SkuSavvy yet',
@@ -209,7 +191,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
         });
       }
       
-      orderData = matchingOrder.node;
+      orderData = result.orders[0];
       console.log(`✓ Found order with UUID: ${orderData.id}`);
       
     } catch (error) {
