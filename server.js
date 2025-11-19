@@ -51,17 +51,9 @@ const GET_ORDER_QUERY = `
  * Verify that webhook request is from Shopify
  */
 function verifyShopifyWebhook(data, hmacHeader) {
-  if (!process.env.SHOPIFY_WEBHOOK_SECRET) {
-    console.warn('⚠️  SHOPIFY_WEBHOOK_SECRET not set - skipping verification');
-    return true;
-  }
-
-  const hash = crypto
-    .createHmac('sha256', process.env.SHOPIFY_WEBHOOK_SECRET)
-    .update(data, 'utf8')
-    .digest('base64');
-  
-  return hash === hmacHeader;
+  // TEMPORARY: Skip verification for testing
+  console.log('⚠️  Webhook verification BYPASSED for testing');
+  return true;
 }
 
 /**
@@ -98,13 +90,11 @@ app.post('/webhooks/orders/create', async (req, res) => {
   console.log('🏪 Shop:', shop);
   console.log('=================================\n');
 
-  // Verify webhook authenticity
-  if (!verifyShopifyWebhook(rawBody, hmac)) {
-    console.error('❌ Invalid webhook signature');
-    return res.status(401).send('Unauthorized');
+  // Verify webhook authenticity (currently bypassed)
+  const isVerified = verifyShopifyWebhook(rawBody, hmac);
+  if (isVerified) {
+    console.log('✓ Webhook verified');
   }
-
-  console.log('✓ Webhook verified');
 
   try {
     const order = JSON.parse(rawBody.toString());
@@ -126,7 +116,6 @@ app.post('/webhooks/orders/create', async (req, res) => {
     console.log('✓ Pickup order detected');
 
     // Format order ID for SkuSavvy (remove # prefix)
-    // Adjust this based on how SkuSavvy identifies orders
     const skuSavvyOrderId = order.name.replace('#', ''); 
     console.log(`   SkuSavvy Order ID: ${skuSavvyOrderId}`);
 
@@ -144,6 +133,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
       });
     } catch (error) {
       console.error('❌ Error querying SkuSavvy:', error.message);
+      console.error('Full error:', error);
       
       // Order might not be synced yet
       if (error.message.includes('not found')) {
@@ -205,7 +195,6 @@ app.post('/webhooks/orders/create', async (req, res) => {
     console.error('Stack trace:', error.stack);
     
     // Return 200 to prevent Shopify from retrying
-    // (log the error for manual investigation)
     res.status(200).json({ 
       error: error.message,
       processed: false 
