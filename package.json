@@ -1,7 +1,25 @@
 {
+  "name": "pickup-order-automation",
+  "version": "1.0.0",
+  "description": "Automatically reassign Shopify pickup orders to Americana warehouse in SkuSavvy",
   "type": "module",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "register-webhook": "node register-webhook.js"
+  },
+  "keywords": [
+    "shopify",
+    "webhook",
+    "skusavvy",
+    "automation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "graphql-request": "^6.1.0",
+    "dotenv": "^16.3.1"
   }
 }

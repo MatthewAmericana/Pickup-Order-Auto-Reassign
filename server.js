@@ -6,14 +6,18 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
+
+// Parse raw body for webhook verification
 app.use(express.raw({ type: 'application/json' }));
 
+// Initialize SkuSavvy GraphQL client
 const skuSavvyClient = new GraphQLClient(process.env.SKUSAVVY_GRAPHQL_ENDPOINT, {
   headers: {
     authorization: `Bearer ${process.env.SKUSAVVY_API_TOKEN}`,
   },
 });
 
+// GraphQL mutation to reassign warehouse
 const REASSIGN_MUTATION = `
   mutation ReassignGenesisToAmericana($orderId: UUID!, $shipmentId: Int!) {
     shipmentReassignLocation(
@@ -21,104 +25,227 @@ const REASSIGN_MUTATION = `
       shipmentId: $shipmentId,
       warehouseId: "${process.env.AMERICANA_WAREHOUSE_ID}"
     ) {
-      shipments { id }
+      shipments { 
+        id 
+        warehouseId
+      }
     }
   }
 `;
 
-// Verify webhook is from Shopify
+// GraphQL query to get order and shipment details
+const GET_ORDER_QUERY = `
+  query GetOrder($orderId: String!) {
+    order(orderId: $orderId) {
+      id
+      shipments {
+        id
+        warehouseId
+        status
+      }
+    }
+  }
+`;
+
+/**
+ * Verify that webhook request is from Shopify
+ */
 function verifyShopifyWebhook(data, hmacHeader) {
+  if (!process.env.SHOPIFY_WEBHOOK_SECRET) {
+    console.warn('⚠️  SHOPIFY_WEBHOOK_SECRET not set - skipping verification');
+    return true;
+  }
+
   const hash = crypto
     .createHmac('sha256', process.env.SHOPIFY_WEBHOOK_SECRET)
     .update(data, 'utf8')
     .digest('base64');
+  
   return hash === hmacHeader;
 }
 
+/**
+ * Check if order is a pickup order based on shipping lines
+ */
+function isPickupOrder(order) {
+  if (!order.shipping_lines || order.shipping_lines.length === 0) {
+    return false;
+  }
+
+  return order.shipping_lines.some(line => {
+    const code = (line.code || '').toLowerCase();
+    const title = (line.title || '').toLowerCase();
+    const source = (line.source || '').toLowerCase();
+
+    return code.includes('pickup') || 
+           title.includes('pickup') || 
+           title.includes('pick up') ||
+           code.includes('local');
+  });
+}
+
+/**
+ * Main webhook handler for order creation
+ */
 app.post('/webhooks/orders/create', async (req, res) => {
   const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const topic = req.get('X-Shopify-Topic');
   const rawBody = req.body;
-  
+
+  console.log('\n=================================');
+  console.log('📦 Webhook received:', topic);
+  console.log('🏪 Shop:', shop);
+  console.log('=================================\n');
+
   // Verify webhook authenticity
   if (!verifyShopifyWebhook(rawBody, hmac)) {
-    console.error('Invalid webhook signature');
+    console.error('❌ Invalid webhook signature');
     return res.status(401).send('Unauthorized');
   }
+
+  console.log('✓ Webhook verified');
 
   try {
     const order = JSON.parse(rawBody.toString());
     
-    console.log(`Processing order #${order.order_number}`);
+    console.log(`\n📋 Processing order #${order.order_number}`);
+    console.log(`   Order ID: ${order.id}`);
+    console.log(`   Order Name: ${order.name}`);
+    console.log(`   Customer: ${order.customer?.email || 'Guest'}`);
 
     // Check if it's a pickup order
-    const isPickupOrder = order.shipping_lines?.some(line => 
-      line.code?.toLowerCase().includes('pickup') ||
-      line.title?.toLowerCase().includes('pickup') ||
-      line.source === 'shopify'
-    );
-
-    if (!isPickupOrder) {
-      console.log('Not a pickup order, skipping');
-      return res.status(200).json({ message: 'Not a pickup order' });
+    if (!isPickupOrder(order)) {
+      console.log('ℹ️  Not a pickup order - skipping reassignment\n');
+      return res.status(200).json({ 
+        message: 'Not a pickup order',
+        processed: false 
+      });
     }
 
     console.log('✓ Pickup order detected');
 
-    // Get SkuSavvy order ID
-    // SkuSavvy might use Shopify order name or ID - adjust as needed
-    const skuSavvyOrderId = order.name.replace('#', ''); // e.g., "1234" from "#1234"
+    // Format order ID for SkuSavvy (remove # prefix)
+    // Adjust this based on how SkuSavvy identifies orders
+    const skuSavvyOrderId = order.name.replace('#', ''); 
+    console.log(`   SkuSavvy Order ID: ${skuSavvyOrderId}`);
+
+    // Small delay to ensure order syncs to SkuSavvy
+    console.log('⏳ Waiting 5 seconds for order sync...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    // Query SkuSavvy for order details
+    console.log('🔍 Querying SkuSavvy for order details...');
     
-    // Query SkuSavvy to get shipment details
-    const orderQuery = `
-      query GetOrder($orderId: String!) {
-        order(orderId: $orderId) {
-          id
-          shipments {
-            id
-            warehouseId
-          }
-        }
+    let orderData;
+    try {
+      orderData = await skuSavvyClient.request(GET_ORDER_QUERY, {
+        orderId: skuSavvyOrderId
+      });
+    } catch (error) {
+      console.error('❌ Error querying SkuSavvy:', error.message);
+      
+      // Order might not be synced yet
+      if (error.message.includes('not found')) {
+        console.log('ℹ️  Order not found in SkuSavvy yet - may need to retry later\n');
+        return res.status(200).json({ 
+          message: 'Order not synced to SkuSavvy yet',
+          processed: false 
+        });
       }
-    `;
-
-    const orderData = await skuSavvyClient.request(orderQuery, {
-      orderId: skuSavvyOrderId
-    });
-
-    if (!orderData.order || !orderData.order.shipments.length) {
-      console.log('No shipments found in SkuSavvy yet');
-      return res.status(200).json({ message: 'No shipments to reassign' });
+      
+      throw error;
     }
 
-    // Reassign each shipment
+    if (!orderData.order || !orderData.order.shipments?.length) {
+      console.log('ℹ️  No shipments found in SkuSavvy yet\n');
+      return res.status(200).json({ 
+        message: 'No shipments to reassign',
+        processed: false 
+      });
+    }
+
+    console.log(`✓ Found ${orderData.order.shipments.length} shipment(s)`);
+
+    // Reassign each shipment to Americana warehouse
+    let reassignedCount = 0;
+    
     for (const shipment of orderData.order.shipments) {
+      console.log(`\n   Shipment ${shipment.id}:`);
+      console.log(`   - Current warehouse: ${shipment.warehouseId}`);
+      console.log(`   - Status: ${shipment.status}`);
+
       if (shipment.warehouseId === process.env.AMERICANA_WAREHOUSE_ID) {
-        console.log(`Shipment ${shipment.id} already at Americana`);
+        console.log('   ✓ Already assigned to Americana');
         continue;
       }
+
+      console.log('   → Reassigning to Americana...');
 
       const result = await skuSavvyClient.request(REASSIGN_MUTATION, {
         orderId: orderData.order.id,
         shipmentId: parseInt(shipment.id),
       });
 
-      console.log(`✓ Reassigned shipment ${shipment.id} to Americana`);
+      console.log('   ✓ Successfully reassigned');
+      reassignedCount++;
     }
 
-    res.status(200).json({ success: true });
+    console.log(`\n✅ Completed: ${reassignedCount} shipment(s) reassigned to Americana\n`);
+
+    res.status(200).json({ 
+      success: true,
+      orderId: order.id,
+      orderNumber: order.order_number,
+      shipmentsReassigned: reassignedCount
+    });
     
   } catch (error) {
-    console.error('Error processing webhook:', error);
-    res.status(500).json({ error: error.message });
+    console.error('\n❌ Error processing webhook:', error);
+    console.error('Stack trace:', error.stack);
+    
+    // Return 200 to prevent Shopify from retrying
+    // (log the error for manual investigation)
+    res.status(200).json({ 
+      error: error.message,
+      processed: false 
+    });
   }
 });
 
-// Health check endpoint
+/**
+ * Health check endpoint
+ */
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+  res.status(200).json({ 
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
 });
 
+/**
+ * Root endpoint
+ */
+app.get('/', (req, res) => {
+  res.status(200).json({
+    service: 'Pickup Order Automation',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      webhook: '/webhooks/orders/create'
+    }
+  });
+});
+
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Webhook server running on port ${PORT}`);
+  console.log('\n🚀 Pickup Order Automation Server');
+  console.log('=================================');
+  console.log(`✓ Server running on port ${PORT}`);
+  console.log(`✓ Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`✓ Shop: ${process.env.SHOPIFY_SHOP}`);
+  console.log(`✓ Warehouse: ${process.env.AMERICANA_WAREHOUSE_ID}`);
+  console.log('=================================\n');
 });
