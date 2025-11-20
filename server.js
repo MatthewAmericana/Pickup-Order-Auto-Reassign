@@ -10,6 +10,20 @@ const app = express();
 // Parse raw body for webhook verification
 app.use(express.raw({ type: 'application/json' }));
 
+// Add CORS headers to allow the HTML interface to call the API
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  
+  next();
+});
+
 // Initialize SkuSavvy GraphQL client
 const skuSavvyClient = new GraphQLClient(process.env.SKUSAVVY_GRAPHQL_ENDPOINT, {
   headers: {
@@ -17,13 +31,28 @@ const skuSavvyClient = new GraphQLClient(process.env.SKUSAVVY_GRAPHQL_ENDPOINT, 
   },
 });
 
-// GraphQL mutation to reassign warehouse
-const REASSIGN_MUTATION = `
+// GraphQL mutation to reassign warehouse to Americana
+const REASSIGN_TO_AMERICANA_MUTATION = `
   mutation ReassignGenesisToAmericana($orderId: UUID!, $shipmentId: Int!) {
     shipmentReassignLocation(
       orderId: $orderId,
       shipmentId: $shipmentId,
       warehouseId: "${process.env.AMERICANA_WAREHOUSE_ID}"
+    ) {
+      shipments { 
+        id
+      }
+    }
+  }
+`;
+
+// GraphQL mutation to reassign warehouse to Genesis (for pickup)
+const REASSIGN_TO_GENESIS_MUTATION = `
+  mutation ReassignAmericanaToGenesis($orderId: UUID!, $shipmentId: Int!) {
+    shipmentReassignLocation(
+      orderId: $orderId,
+      shipmentId: $shipmentId,
+      warehouseId: "${process.env.GENESIS_WAREHOUSE_ID}"
     ) {
       shipments { 
         id
@@ -187,7 +216,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
     
     for (const shipment of shipments) {
       try {
-        await skuSavvyClient.request(REASSIGN_MUTATION, {
+        await skuSavvyClient.request(REASSIGN_TO_AMERICANA_MUTATION, {
           orderId: orderUUID,
           shipmentId: parseInt(shipment.id),
         });
@@ -230,81 +259,50 @@ app.post('/webhooks/*', async (req, res) => {
  * Call this after packing at Americana to prepare for customer pickup
  * 
  * POST /api/reassign-to-genesis
- * Body: { "orderNumber": "APA411542" } or { "orderId": "uuid-here" }
+ * Body: { "orderNumber": "APA411542" }
  */
 app.post('/api/reassign-to-genesis', async (req, res) => {
   try {
     const body = JSON.parse(req.body.toString());
-    const { orderNumber, orderId } = body;
+    const { orderNumber } = body;
 
-    if (!orderNumber && !orderId) {
+    if (!orderNumber) {
       return res.status(400).json({ 
-        error: 'Missing orderNumber or orderId in request body' 
+        error: 'Missing orderNumber in request body' 
       });
     }
 
     console.log('\n=================================');
-    console.log(`🔄 Reassigning to Genesis: ${orderNumber || orderId}`);
+    console.log(`🔄 Reassigning to Genesis: ${orderNumber}`);
     console.log('=================================');
 
-    let orderUUID;
-    let shipments;
+    // Remove # if present
+    const apaOrderNumber = orderNumber.replace('#', '');
+    
+    console.log('🔍 Finding order in SkuSavvy...');
+    
+    const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
+      apaOrderNumber: apaOrderNumber
+    });
 
-    // If we have order number, find the UUID first
-    if (orderNumber) {
-      const apaOrderNumber = orderNumber.replace('#', '');
-      console.log('🔍 Finding order in SkuSavvy...');
-      
-      const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
-        apaOrderNumber: apaOrderNumber
-      });
-
-      if (!result.orders || result.orders.length === 0) {
-        console.log('❌ Order not found');
-        return res.status(404).json({ error: 'Order not found in SkuSavvy' });
-      }
-
-      orderUUID = result.orders[0].id;
-      shipments = result.orders[0].shipments || [];
-    } else {
-      // We already have the UUID
-      orderUUID = orderId;
-      
-      // Get shipments
-      const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
-        apaOrderNumber: orderId
-      });
-
-      if (!result.orders || result.orders.length === 0) {
-        console.log('❌ Order not found');
-        return res.status(404).json({ error: 'Order not found in SkuSavvy' });
-      }
-
-      shipments = result.orders[0].shipments || [];
+    if (!result.orders || result.orders.length === 0) {
+      console.log('❌ Order not found');
+      console.log('=================================\n');
+      return res.status(404).json({ error: 'Order not found in SkuSavvy' });
     }
+
+    const orderUUID = result.orders[0].id;
+    const shipments = result.orders[0].shipments || [];
 
     console.log(`✅ Found: ${shipments.length} shipment(s)`);
 
     if (shipments.length === 0) {
       console.log('⚠️  No shipments found');
+      console.log('=================================\n');
       return res.status(400).json({ error: 'No shipments to reassign' });
     }
 
     // Reassign each shipment to Genesis warehouse
-    const REASSIGN_TO_GENESIS_MUTATION = `
-      mutation ReassignAmericanaToGenesis($orderId: UUID!, $shipmentId: Int!) {
-        shipmentReassignLocation(
-          orderId: $orderId,
-          shipmentId: $shipmentId,
-          warehouseId: "${process.env.GENESIS_WAREHOUSE_ID}"
-        ) {
-          shipments { 
-            id
-          }
-        }
-      }
-    `;
-
     let reassignedCount = 0;
     
     for (const shipment of shipments) {
@@ -331,6 +329,7 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error:', error.message);
+    console.log('=================================\n');
     res.status(500).json({ 
       error: error.message 
     });
