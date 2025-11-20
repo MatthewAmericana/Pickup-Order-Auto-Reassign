@@ -32,27 +32,17 @@ const REASSIGN_MUTATION = `
   }
 `;
 
-// GraphQL query to find order by number - ONLY query id
-const FIND_ORDER_QUERY = `
-  query GetSkuSavvyOrderId($apaOrderNumber: String!) {
+// GraphQL query to find order and get shipment IDs
+// We just need the order UUID and shipment IDs - no need to check current warehouse
+const FIND_ORDER_AND_SHIPMENTS_QUERY = `
+  query GetOrderAndShipments($apaOrderNumber: String!) {
     orders(id: $apaOrderNumber, limit: 1) {
       __typename
       ... on CustomerOrder {
         id
-      }
-    }
-  }
-`;
-
-// GraphQL query to get shipments for an order
-// Using outboundOrder since we have the UUID and need CustomerOrder type
-const GET_SHIPMENTS_QUERY = `
-  query GetOrderShipments($orderId: ID!) {
-    outboundOrder(orderId: $orderId) {
-      id
-      shipments {
-        id
-        warehouseId
+        shipments {
+          id
+        }
       }
     }
   }
@@ -175,12 +165,14 @@ app.post('/webhooks/orders/create', async (req, res) => {
     console.log('⏳ Waiting 10 seconds for order sync...');
     await new Promise(resolve => setTimeout(resolve, 10000));
 
-    // Step 1: Find the order UUID in SkuSavvy
-    console.log('🔍 Finding order UUID in SkuSavvy...');
+    // Step 1: Find the order and get shipments in one query
+    console.log('🔍 Finding order and shipments in SkuSavvy...');
     
     let orderUUID;
+    let shipments;
+    
     try {
-      const result = await skuSavvyClient.request(FIND_ORDER_QUERY, {
+      const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
         apaOrderNumber: apaOrderNumber
       });
       
@@ -197,8 +189,12 @@ app.post('/webhooks/orders/create', async (req, res) => {
         });
       }
       
-      orderUUID = result.orders[0].id;
+      const orderData = result.orders[0];
+      orderUUID = orderData.id;
+      shipments = orderData.shipments || [];
+      
       console.log(`✓ Found order UUID: ${orderUUID}`);
+      console.log(`✓ Found ${shipments.length} shipment(s)`);
       
     } catch (error) {
       console.error('❌ Error finding order in SkuSavvy:', error.message);
@@ -210,41 +206,7 @@ app.post('/webhooks/orders/create', async (req, res) => {
       throw error;
     }
 
-    // Step 2: Get shipments for this order
-    // Using outboundOrder which returns the CustomerOrder directly
-    console.log('🔍 Getting shipments for order...');
-    
-    let orderData;
-    try {
-      orderData = await skuSavvyClient.request(GET_SHIPMENTS_QUERY, {
-        orderId: orderUUID  // Pass the UUID
-      });
-      
-      console.log('✓ Retrieved shipments data');
-      console.log('   Raw response:', JSON.stringify(orderData, null, 2));
-      
-    } catch (error) {
-      console.error('❌ Error getting shipments:', error.message);
-      
-      if (error.response) {
-        console.error('   Response errors:', JSON.stringify(error.response.errors, null, 2));
-      }
-      
-      throw error;
-    }
-
-    // outboundOrder returns the order directly (not in an array)
-    const orderInfo = orderData.outboundOrder;
-    
-    if (!orderInfo) {
-      console.log('ℹ️  Order not found when querying shipments\n');
-      return res.status(200).json({ 
-        message: 'Order not found in outbound query',
-        processed: false 
-      });
-    }
-    
-    if (!orderInfo.shipments || orderInfo.shipments.length === 0) {
+    if (shipments.length === 0) {
       console.log('ℹ️  No shipments found in order\n');
       return res.status(200).json({ 
         message: 'No shipments to reassign',
@@ -252,21 +214,13 @@ app.post('/webhooks/orders/create', async (req, res) => {
       });
     }
 
-    console.log(`✓ Found ${orderInfo.shipments.length} shipment(s)`);
-
-    // Step 3: Reassign each shipment to Americana warehouse
+    // Step 2: Reassign each shipment to Americana warehouse
+    // Note: Pickup orders are always from Genesis, so we always reassign
     let reassignedCount = 0;
     
-    for (const shipment of orderInfo.shipments) {
+    for (const shipment of shipments) {
       console.log(`\n   📦 Shipment ${shipment.id}:`);
-      console.log(`      Current warehouse ID: ${shipment.warehouseId || 'unknown'}`);
-
-      if (shipment.warehouseId === process.env.AMERICANA_WAREHOUSE_ID) {
-        console.log('      ✓ Already assigned to Americana');
-        continue;
-      }
-
-      console.log('      → Reassigning to Americana...');
+      console.log(`      → Reassigning from Genesis to Americana...`);
 
       try {
         const result = await skuSavvyClient.request(REASSIGN_MUTATION, {
