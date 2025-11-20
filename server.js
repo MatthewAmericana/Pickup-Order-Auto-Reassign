@@ -255,8 +255,8 @@ app.post('/webhooks/*', async (req, res) => {
 });
 
 /**
- * Manual endpoint to reassign packed order back to Genesis for pickup
- * Call this after packing at Americana to prepare for customer pickup
+ * Manual endpoint to transfer order to Genesis pickup location
+ * Uses Shopify's API (same as "Transfer to pickup location" button)
  * 
  * POST /api/reassign-to-genesis
  * Body: { "orderNumber": "APA411542" }
@@ -273,68 +273,113 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
     }
 
     console.log('\n=================================');
-    console.log(`🔄 Reassigning to Genesis: ${orderNumber}`);
+    console.log(`🔄 Transferring to Genesis: ${orderNumber}`);
     console.log('=================================');
 
-    // Remove # if present
-    const apaOrderNumber = orderNumber.replace('#', '');
+    // Remove # if present and get Shopify order ID
+    const orderName = orderNumber.startsWith('#') ? orderNumber : `#${orderNumber}`;
     
-    console.log('🔍 Finding order in SkuSavvy...');
+    console.log('🔍 Finding Shopify order...');
     
-    const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
-      apaOrderNumber: apaOrderNumber
-    });
+    // Search for order by name in Shopify
+    const searchResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders.json?name=${encodeURIComponent(orderName)}&status=any`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
 
-    if (!result.orders || result.orders.length === 0) {
-      console.log('❌ Order not found');
-      console.log('=================================\n');
-      return res.status(404).json({ error: 'Order not found in SkuSavvy' });
+    if (!searchResponse.ok) {
+      throw new Error(`Shopify API error: ${searchResponse.status}`);
     }
 
-    const orderUUID = result.orders[0].id;
-    const shipments = result.orders[0].shipments || [];
-
-    console.log(`✅ Found: ${shipments.length} shipment(s)`);
-
-    if (shipments.length === 0) {
-      console.log('⚠️  No shipments found');
+    const searchData = await searchResponse.json();
+    
+    if (!searchData.orders || searchData.orders.length === 0) {
+      console.log('❌ Order not found in Shopify');
       console.log('=================================\n');
-      return res.status(400).json({ error: 'No shipments to reassign' });
+      return res.status(404).json({ error: 'Order not found in Shopify' });
     }
 
-    // Reassign each shipment to Genesis warehouse
-    let reassignedCount = 0;
+    const order = searchData.orders[0];
+    console.log(`✅ Found Shopify order: ${order.id}`);
+
+    // Get fulfillment orders for this order
+    const fulfillmentOrdersResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders/${order.id}/fulfillment_orders.json`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
+
+    if (!fulfillmentOrdersResponse.ok) {
+      throw new Error(`Failed to get fulfillment orders: ${fulfillmentOrdersResponse.status}`);
+    }
+
+    const fulfillmentData = await fulfillmentOrdersResponse.json();
     
-    for (const shipment of shipments) {
+    if (!fulfillmentData.fulfillment_orders || fulfillmentData.fulfillment_orders.length === 0) {
+      console.log('❌ No fulfillment orders found');
+      console.log('=================================\n');
+      return res.status(400).json({ error: 'No fulfillment orders found' });
+    }
+
+    console.log(`✅ Found ${fulfillmentData.fulfillment_orders.length} fulfillment order(s)`);
+
+    // Move each fulfillment order to Genesis location
+    let transferredCount = 0;
+    
+    for (const fulfillmentOrder of fulfillmentData.fulfillment_orders) {
       try {
-        console.log(`   Reassigning shipment ${shipment.id}...`);
-        console.log(`   - Order UUID: ${orderUUID}`);
-        console.log(`   - Shipment ID: ${shipment.id}`);
-        console.log(`   - Target Warehouse (Genesis): ${process.env.GENESIS_WAREHOUSE_ID}`);
-        
-        const mutationResult = await skuSavvyClient.request(REASSIGN_TO_GENESIS_MUTATION, {
-          orderId: orderUUID,
-          shipmentId: parseInt(shipment.id),
-        });
-        
-        console.log(`   - Response:`, JSON.stringify(mutationResult, null, 2));
-        reassignedCount++;
-      } catch (error) {
-        console.error(`❌ Shipment ${shipment.id} failed:`, error.message);
-        if (error.response) {
-          console.error('   Full error:', JSON.stringify(error.response, null, 2));
+        // Check if already at Genesis
+        if (fulfillmentOrder.assigned_location?.name?.includes('Genesis')) {
+          console.log(`   ✓ Fulfillment order ${fulfillmentOrder.id} already at Genesis`);
+          continue;
         }
+
+        console.log(`   → Moving fulfillment order ${fulfillmentOrder.id} to Genesis...`);
+
+        // Use Shopify's fulfillment order move endpoint
+        const moveResponse = await fetch(
+          `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/fulfillment_orders/${fulfillmentOrder.id}/move.json`,
+          {
+            method: 'POST',
+            headers: {
+              'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              fulfillment_order: {
+                new_location_id: process.env.GENESIS_LOCATION_ID, // Shopify location ID for Genesis
+              }
+            })
+          }
+        );
+
+        if (moveResponse.ok) {
+          console.log(`   ✅ Successfully transferred to Genesis`);
+          transferredCount++;
+        } else {
+          const errorData = await moveResponse.json();
+          console.error(`   ❌ Failed:`, JSON.stringify(errorData, null, 2));
+        }
+      } catch (error) {
+        console.error(`   ❌ Error moving fulfillment order:`, error.message);
       }
     }
 
-    console.log(`🎉 SUCCESS: ${reassignedCount}/${shipments.length} shipment(s) reassigned Americana → Genesis`);
+    console.log(`🎉 SUCCESS: ${transferredCount}/${fulfillmentData.fulfillment_orders.length} fulfillment order(s) transferred to Genesis`);
     console.log('=================================\n');
 
     res.status(200).json({ 
       success: true,
-      message: 'Order reassigned to Genesis for pickup',
-      shipmentsReassigned: reassignedCount,
-      orderUUID: orderUUID
+      message: 'Order transferred to Genesis for pickup',
+      fulfillmentOrdersTransferred: transferredCount,
+      orderId: order.id
     });
 
   } catch (error) {
