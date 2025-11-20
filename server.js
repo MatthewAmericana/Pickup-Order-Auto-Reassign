@@ -255,6 +255,69 @@ app.post('/webhooks/*', async (req, res) => {
 });
 
 /**
+ * DEBUG endpoint to see what fulfillment data we're getting
+ */
+app.post('/api/debug-order', async (req, res) => {
+  try {
+    const body = JSON.parse(req.body.toString());
+    const { orderNumber } = body;
+
+    const orderName = orderNumber.startsWith('#') ? orderNumber : `#${orderNumber}`;
+    
+    console.log('\n=== DEBUG ORDER ===');
+    console.log('Searching for:', orderName);
+    
+    // Get the order
+    const searchResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders.json?name=${encodeURIComponent(orderName)}&status=any`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
+
+    const searchData = await searchResponse.json();
+    
+    if (!searchData.orders || searchData.orders.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const order = searchData.orders[0];
+    
+    console.log('Order ID:', order.id);
+    console.log('Fulfillment status:', order.fulfillment_status);
+    
+    // Get fulfillment orders
+    const fulfillmentOrdersResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders/${order.id}/fulfillment_orders.json`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
+
+    const fulfillmentData = await fulfillmentOrdersResponse.json();
+    
+    console.log('Fulfillment orders response:', JSON.stringify(fulfillmentData, null, 2));
+    
+    res.json({
+      orderId: order.id,
+      fulfillmentStatus: order.fulfillment_status,
+      financialStatus: order.financial_status,
+      fulfillmentOrdersFound: fulfillmentData.fulfillment_orders?.length || 0,
+      fulfillmentOrders: fulfillmentData.fulfillment_orders || [],
+      rawResponse: fulfillmentData
+    });
+    
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
+
+/**
  * Manual endpoint to transfer order to Genesis pickup location
  * Uses Shopify's API (same as "Transfer to pickup location" button)
  * 
@@ -305,6 +368,8 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
 
     const order = searchData.orders[0];
     console.log(`✅ Found Shopify order: ${order.id}`);
+    console.log(`   Fulfillment status: ${order.fulfillment_status || 'unfulfilled'}`);
+    console.log(`   Financial status: ${order.financial_status || 'unknown'}`);
 
     // Get fulfillment orders for this order
     const fulfillmentOrdersResponse = await fetch(
@@ -324,11 +389,28 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
     
     if (!fulfillmentData.fulfillment_orders || fulfillmentData.fulfillment_orders.length === 0) {
       console.log('❌ No fulfillment orders found');
+      console.log('   This usually means:');
+      console.log('   - Order is already fulfilled');
+      console.log('   - Order is cancelled');
+      console.log('   - Order is already at the correct location');
+      console.log(`   Order status: ${order.fulfillment_status || 'unfulfilled'}`);
+      console.log(`   Financial status: ${order.financial_status || 'unknown'}`);
+      console.log('   Raw response:', JSON.stringify(fulfillmentData, null, 2));
       console.log('=================================\n');
-      return res.status(400).json({ error: 'No fulfillment orders found' });
+      return res.status(400).json({ 
+        error: 'No fulfillment orders found',
+        orderStatus: order.fulfillment_status,
+        financialStatus: order.financial_status,
+        details: 'Order may already be fulfilled or at the correct location. Check /api/debug-order endpoint for more details.'
+      });
     }
 
     console.log(`✅ Found ${fulfillmentData.fulfillment_orders.length} fulfillment order(s)`);
+    
+    // Log details about each fulfillment order for debugging
+    fulfillmentData.fulfillment_orders.forEach((fo, idx) => {
+      console.log(`   ${idx + 1}. Status: ${fo.status}, Location: ${fo.assigned_location?.name || 'Unknown'}`);
+    });
 
     // Move each fulfillment order to Genesis location
     let transferredCount = 0;
@@ -392,6 +474,87 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
 });
 
 /**
+ * Get recent pickup orders that need to be transferred back to Genesis
+ * These are unfulfilled orders tagged with 'pickup-order' that are currently at Americana
+ */
+app.get('/api/pickup-orders', async (req, res) => {
+  try {
+    console.log('🔍 Fetching recent pickup orders...');
+    
+    // Get recent unfulfilled orders with pickup-order tag
+    const ordersResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders.json?status=unfulfilled&limit=50&tags=pickup-order`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
+
+    if (!ordersResponse.ok) {
+      throw new Error(`Shopify API error: ${ordersResponse.status}`);
+    }
+
+    const ordersData = await ordersResponse.json();
+    const pickupOrders = [];
+
+    // For each order, check if it has fulfillment orders at Americana
+    for (const order of ordersData.orders || []) {
+      try {
+        const fulfillmentOrdersResponse = await fetch(
+          `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders/${order.id}/fulfillment_orders.json`,
+          {
+            headers: {
+              'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+            },
+          }
+        );
+
+        if (fulfillmentOrdersResponse.ok) {
+          const fulfillmentData = await fulfillmentOrdersResponse.json();
+          
+          // Check if any fulfillment orders are at Americana (not Genesis)
+          const atAmericana = fulfillmentData.fulfillment_orders?.some(fo => 
+            fo.assigned_location?.name && 
+            !fo.assigned_location.name.includes('Genesis') &&
+            fo.status === 'open'
+          );
+
+          if (atAmericana) {
+            pickupOrders.push({
+              id: order.id,
+              name: order.name,
+              orderNumber: order.name.replace('#', ''),
+              createdAt: order.created_at,
+              customerName: `${order.customer?.first_name || ''} ${order.customer?.last_name || ''}`.trim(),
+              totalPrice: order.total_price,
+              itemCount: order.line_items?.length || 0
+            });
+          }
+        }
+      } catch (error) {
+        console.error(`Error checking order ${order.name}:`, error.message);
+      }
+    }
+
+    console.log(`✅ Found ${pickupOrders.length} pickup orders at Americana`);
+    
+    res.json({ 
+      success: true,
+      orders: pickupOrders,
+      count: pickupOrders.length
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching pickup orders:', error.message);
+    res.status(500).json({ 
+      error: error.message,
+      orders: []
+    });
+  }
+});
+
+/**
  * Health check endpoint
  */
 app.get('/health', (req, res) => {
@@ -412,7 +575,8 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/health',
       webhook: '/webhooks/orders/create',
-      reassignInterface: '/reassign'
+      reassignInterface: '/reassign',
+      debugOrder: '/api/debug-order'
     }
   });
 });
@@ -477,18 +641,51 @@ app.get('/reassign', (req, res) => {
             font-size: 14px;
         }
 
-        input {
+        select, input {
             width: 100%;
             padding: 15px;
             border: 2px solid #e0e0e0;
             border-radius: 10px;
             font-size: 16px;
             transition: border-color 0.3s;
+            background: white;
         }
 
-        input:focus {
+        select:focus, input:focus {
             outline: none;
             border-color: #667eea;
+        }
+
+        .loading-orders {
+            color: #999;
+            font-style: italic;
+            padding: 15px;
+            text-align: center;
+        }
+
+        .no-orders {
+            color: #f39c12;
+            padding: 15px;
+            text-align: center;
+            background: #fff3cd;
+            border: 1px solid #ffeeba;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .manual-entry-link {
+            text-align: center;
+            margin-top: 15px;
+        }
+
+        .manual-entry-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .manual-entry-link a:hover {
+            text-decoration: underline;
         }
 
         button {
@@ -568,21 +765,31 @@ app.get('/reassign', (req, res) => {
         <p class="subtitle">After packing at Americana, use this to prepare order for customer pickup</p>
 
         <form id="reassignForm">
-            <div class="input-group">
+            <div class="input-group" id="orderSelectGroup">
+                <label for="orderSelect">Select Order to Transfer</label>
+                <select id="orderSelect" required>
+                    <option value="">Loading orders...</option>
+                </select>
+                <div class="example">Select a pickup order currently at Americana</div>
+            </div>
+
+            <div class="input-group" id="orderInputGroup" style="display: none;">
                 <label for="orderNumber">Order Number</label>
                 <input 
                     type="text" 
                     id="orderNumber" 
-                    placeholder="APA411542" 
-                    required
-                    autofocus
+                    placeholder="APA411542"
                 >
                 <div class="example">Example: APA411542 or #APA411542</div>
             </div>
 
             <button type="submit" id="submitBtn">
-                🚀 Reassign to Genesis
+                🚀 Transfer to Genesis
             </button>
+
+            <div class="manual-entry-link">
+                <a href="#" id="toggleManualEntry">Enter order number manually</a>
+            </div>
         </form>
 
         <div id="status" class="status"></div>
@@ -591,26 +798,89 @@ app.get('/reassign', (req, res) => {
     <script>
         // API URL is same origin since we're serving from the same server
         const API_URL = '/api/reassign-to-genesis';
+        const ORDERS_API_URL = '/api/pickup-orders';
 
         const form = document.getElementById('reassignForm');
-        const input = document.getElementById('orderNumber');
+        const orderSelect = document.getElementById('orderSelect');
+        const orderInput = document.getElementById('orderNumber');
+        const orderSelectGroup = document.getElementById('orderSelectGroup');
+        const orderInputGroup = document.getElementById('orderInputGroup');
         const submitBtn = document.getElementById('submitBtn');
         const status = document.getElementById('status');
+        const toggleManualEntry = document.getElementById('toggleManualEntry');
+        
+        let useManualEntry = false;
+        let ordersData = [];
+
+        // Load pickup orders on page load
+        async function loadPickupOrders() {
+            try {
+                const response = await fetch(ORDERS_API_URL);
+                const data = await response.json();
+                
+                if (data.success && data.orders.length > 0) {
+                    ordersData = data.orders;
+                    
+                    // Populate dropdown
+                    orderSelect.innerHTML = '<option value="">-- Select an order --</option>';
+                    data.orders.forEach(order => {
+                        const option = document.createElement('option');
+                        option.value = order.orderNumber;
+                        option.textContent = \`\${order.name} - \${order.customerName || 'Customer'} (\${order.itemCount} item\${order.itemCount !== 1 ? 's' : ''})\`;
+                        orderSelect.appendChild(option);
+                    });
+                } else {
+                    orderSelect.innerHTML = '<option value="">No orders need transfer</option>';
+                    const noOrdersMsg = document.createElement('div');
+                    noOrdersMsg.className = 'no-orders';
+                    noOrdersMsg.textContent = '✅ All pickup orders are already at Genesis! Nothing to transfer right now.';
+                    orderSelectGroup.insertBefore(noOrdersMsg, orderSelect);
+                }
+            } catch (error) {
+                console.error('Error loading orders:', error);
+                orderSelect.innerHTML = '<option value="">Error loading orders</option>';
+                showStatus('error', \`❌ Could not load orders: \${error.message}\`);
+            }
+        }
+
+        // Toggle between dropdown and manual entry
+        toggleManualEntry.addEventListener('click', (e) => {
+            e.preventDefault();
+            useManualEntry = !useManualEntry;
+            
+            if (useManualEntry) {
+                orderSelectGroup.style.display = 'none';
+                orderInputGroup.style.display = 'block';
+                toggleManualEntry.textContent = 'Select from list instead';
+                orderInput.required = true;
+                orderSelect.required = false;
+                orderInput.focus();
+            } else {
+                orderSelectGroup.style.display = 'block';
+                orderInputGroup.style.display = 'none';
+                toggleManualEntry.textContent = 'Enter order number manually';
+                orderInput.required = false;
+                orderSelect.required = true;
+                orderSelect.focus();
+            }
+        });
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             
-            const orderNumber = input.value.trim();
+            const orderNumber = useManualEntry ? 
+                orderInput.value.trim() : 
+                orderSelect.value;
             
             if (!orderNumber) {
-                showStatus('error', '❌ Please enter an order number');
+                showStatus('error', '❌ Please select or enter an order number');
                 return;
             }
 
             // Disable button and show loading
             submitBtn.disabled = true;
-            submitBtn.textContent = '⏳ Reassigning...';
-            showStatus('loading', '🔄 Sending request to SkuSavvy...');
+            submitBtn.textContent = '⏳ Transferring...';
+            showStatus('loading', '🔄 Moving order to Genesis...');
 
             try {
                 const response = await fetch(API_URL, {
@@ -624,22 +894,30 @@ app.get('/reassign', (req, res) => {
                 const data = await response.json();
 
                 if (response.ok && data.success) {
-                    showStatus('success', \`✅ Success! \${data.shipmentsReassigned} shipment(s) reassigned to Genesis. You can now mark as ready for pickup in SkuSavvy!\`);
-                    input.value = '';
+                    showStatus('success', \`✅ Success! Order transferred to Genesis. You can now print pickup label in SkuSavvy!\`);
+                    
+                    // Clear and reload
+                    orderInput.value = '';
+                    orderSelect.value = '';
+                    
+                    // Reload orders after 2 seconds
+                    setTimeout(() => {
+                        loadPickupOrders();
+                    }, 2000);
                     
                     // Auto-hide success message after 10 seconds
                     setTimeout(() => {
                         status.style.display = 'none';
                     }, 10000);
                 } else {
-                    showStatus('error', \`❌ Error: \${data.error || 'Failed to reassign order'}\`);
+                    showStatus('error', \`❌ Error: \${data.error || 'Failed to transfer order'}. \${data.details || ''}\`);
                 }
             } catch (error) {
                 showStatus('error', \`❌ Network error: \${error.message}. Make sure the server is running!\`);
             } finally {
                 // Re-enable button
                 submitBtn.disabled = false;
-                submitBtn.textContent = '🚀 Reassign to Genesis';
+                submitBtn.textContent = '🚀 Transfer to Genesis';
             }
         });
 
@@ -649,12 +927,8 @@ app.get('/reassign', (req, res) => {
             status.style.display = 'block';
         }
 
-        // Allow Enter key to submit
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                form.dispatchEvent(new Event('submit'));
-            }
-        });
+        // Load orders on page load
+        loadPickupOrders();
     </script>
 </body>
 </html>`);
@@ -670,6 +944,7 @@ app.listen(PORT, () => {
   console.log(`✓ Shop: ${process.env.SHOPIFY_SHOP}`);
   console.log(`✓ Americana Warehouse: ${process.env.AMERICANA_WAREHOUSE_ID}`);
   console.log(`✓ Genesis Warehouse: ${process.env.GENESIS_WAREHOUSE_ID}`);
+  console.log(`✓ Genesis Location: ${process.env.GENESIS_LOCATION_ID}`);
   console.log(`✓ SkuSavvy Endpoint: ${process.env.SKUSAVVY_GRAPHQL_ENDPOINT}`);
   console.log('=================================\n');
 });
