@@ -45,15 +45,14 @@ const FIND_ORDER_QUERY = `
 `;
 
 // GraphQL query to get shipments for an order
+// Using outboundOrder since we have the UUID and need CustomerOrder type
 const GET_SHIPMENTS_QUERY = `
-  query GetOrderShipments($orderId: UUID!) {
-    customerOrder(id: $orderId) {
+  query GetOrderShipments($orderId: ID!) {
+    outboundOrder(orderId: $orderId) {
       id
       shipments {
         id
-        warehouse {
-          id
-        }
+        warehouseId
       }
     }
   }
@@ -212,15 +211,17 @@ app.post('/webhooks/orders/create', async (req, res) => {
     }
 
     // Step 2: Get shipments for this order
+    // Using outboundOrder which returns the CustomerOrder directly
     console.log('🔍 Getting shipments for order...');
     
     let orderData;
     try {
       orderData = await skuSavvyClient.request(GET_SHIPMENTS_QUERY, {
-        orderId: orderUUID
+        orderId: orderUUID  // Pass the UUID
       });
       
-      console.log('✓ Retrieved shipments');
+      console.log('✓ Retrieved shipments data');
+      console.log('   Raw response:', JSON.stringify(orderData, null, 2));
       
     } catch (error) {
       console.error('❌ Error getting shipments:', error.message);
@@ -232,7 +233,18 @@ app.post('/webhooks/orders/create', async (req, res) => {
       throw error;
     }
 
-    if (!orderData.customerOrder || !orderData.customerOrder.shipments || !orderData.customerOrder.shipments.length) {
+    // outboundOrder returns the order directly (not in an array)
+    const orderInfo = orderData.outboundOrder;
+    
+    if (!orderInfo) {
+      console.log('ℹ️  Order not found when querying shipments\n');
+      return res.status(200).json({ 
+        message: 'Order not found in outbound query',
+        processed: false 
+      });
+    }
+    
+    if (!orderInfo.shipments || orderInfo.shipments.length === 0) {
       console.log('ℹ️  No shipments found in order\n');
       return res.status(200).json({ 
         message: 'No shipments to reassign',
@@ -240,16 +252,16 @@ app.post('/webhooks/orders/create', async (req, res) => {
       });
     }
 
-    console.log(`✓ Found ${orderData.customerOrder.shipments.length} shipment(s)`);
+    console.log(`✓ Found ${orderInfo.shipments.length} shipment(s)`);
 
     // Step 3: Reassign each shipment to Americana warehouse
     let reassignedCount = 0;
     
-    for (const shipment of orderData.customerOrder.shipments) {
+    for (const shipment of orderInfo.shipments) {
       console.log(`\n   📦 Shipment ${shipment.id}:`);
-      console.log(`      Current warehouse: ${shipment.warehouse?.id || 'unknown'}`);
+      console.log(`      Current warehouse ID: ${shipment.warehouseId || 'unknown'}`);
 
-      if (shipment.warehouse?.id === process.env.AMERICANA_WAREHOUSE_ID) {
+      if (shipment.warehouseId === process.env.AMERICANA_WAREHOUSE_ID) {
         console.log('      ✓ Already assigned to Americana');
         continue;
       }
