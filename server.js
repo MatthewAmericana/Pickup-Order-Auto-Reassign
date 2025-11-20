@@ -255,6 +255,69 @@ app.post('/webhooks/*', async (req, res) => {
 });
 
 /**
+ * DEBUG endpoint to see what fulfillment data we're getting
+ */
+app.post('/api/debug-order', async (req, res) => {
+  try {
+    const body = JSON.parse(req.body.toString());
+    const { orderNumber } = body;
+
+    const orderName = orderNumber.startsWith('#') ? orderNumber : `#${orderNumber}`;
+    
+    console.log('\n=== DEBUG ORDER ===');
+    console.log('Searching for:', orderName);
+    
+    // Get the order
+    const searchResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders.json?name=${encodeURIComponent(orderName)}&status=any`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
+
+    const searchData = await searchResponse.json();
+    
+    if (!searchData.orders || searchData.orders.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const order = searchData.orders[0];
+    
+    console.log('Order ID:', order.id);
+    console.log('Fulfillment status:', order.fulfillment_status);
+    
+    // Get fulfillment orders
+    const fulfillmentOrdersResponse = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2024-10/orders/${order.id}/fulfillment_orders.json`,
+      {
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ACCESS_TOKEN,
+        },
+      }
+    );
+
+    const fulfillmentData = await fulfillmentOrdersResponse.json();
+    
+    console.log('Fulfillment orders response:', JSON.stringify(fulfillmentData, null, 2));
+    
+    res.json({
+      orderId: order.id,
+      fulfillmentStatus: order.fulfillment_status,
+      financialStatus: order.financial_status,
+      fulfillmentOrdersFound: fulfillmentData.fulfillment_orders?.length || 0,
+      fulfillmentOrders: fulfillmentData.fulfillment_orders || [],
+      rawResponse: fulfillmentData
+    });
+    
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
+
+/**
  * Manual endpoint to transfer order to Genesis pickup location
  * Uses Shopify's API (same as "Transfer to pickup location" button)
  * 
@@ -305,6 +368,8 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
 
     const order = searchData.orders[0];
     console.log(`✅ Found Shopify order: ${order.id}`);
+    console.log(`   Fulfillment status: ${order.fulfillment_status || 'unfulfilled'}`);
+    console.log(`   Financial status: ${order.financial_status || 'unknown'}`);
 
     // Get fulfillment orders for this order
     const fulfillmentOrdersResponse = await fetch(
@@ -324,11 +389,28 @@ app.post('/api/reassign-to-genesis', async (req, res) => {
     
     if (!fulfillmentData.fulfillment_orders || fulfillmentData.fulfillment_orders.length === 0) {
       console.log('❌ No fulfillment orders found');
+      console.log('   This usually means:');
+      console.log('   - Order is already fulfilled');
+      console.log('   - Order is cancelled');
+      console.log('   - Order is already at the correct location');
+      console.log(`   Order status: ${order.fulfillment_status || 'unfulfilled'}`);
+      console.log(`   Financial status: ${order.financial_status || 'unknown'}`);
+      console.log('   Raw response:', JSON.stringify(fulfillmentData, null, 2));
       console.log('=================================\n');
-      return res.status(400).json({ error: 'No fulfillment orders found' });
+      return res.status(400).json({ 
+        error: 'No fulfillment orders found',
+        orderStatus: order.fulfillment_status,
+        financialStatus: order.financial_status,
+        details: 'Order may already be fulfilled or at the correct location. Check /api/debug-order endpoint for more details.'
+      });
     }
 
     console.log(`✅ Found ${fulfillmentData.fulfillment_orders.length} fulfillment order(s)`);
+    
+    // Log details about each fulfillment order for debugging
+    fulfillmentData.fulfillment_orders.forEach((fo, idx) => {
+      console.log(`   ${idx + 1}. Status: ${fo.status}, Location: ${fo.assigned_location?.name || 'Unknown'}`);
+    });
 
     // Move each fulfillment order to Genesis location
     let transferredCount = 0;
@@ -412,7 +494,8 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/health',
       webhook: '/webhooks/orders/create',
-      reassignInterface: '/reassign'
+      reassignInterface: '/reassign',
+      debugOrder: '/api/debug-order'
     }
   });
 });
@@ -610,7 +693,7 @@ app.get('/reassign', (req, res) => {
             // Disable button and show loading
             submitBtn.disabled = true;
             submitBtn.textContent = '⏳ Reassigning...';
-            showStatus('loading', '🔄 Sending request to SkuSavvy...');
+            showStatus('loading', '🔄 Sending request to Shopify...');
 
             try {
                 const response = await fetch(API_URL, {
@@ -624,7 +707,7 @@ app.get('/reassign', (req, res) => {
                 const data = await response.json();
 
                 if (response.ok && data.success) {
-                    showStatus('success', \`✅ Success! \${data.shipmentsReassigned} shipment(s) reassigned to Genesis. You can now mark as ready for pickup in SkuSavvy!\`);
+                    showStatus('success', \`✅ Success! \${data.fulfillmentOrdersTransferred} fulfillment order(s) transferred to Genesis. You can now print pickup label in SkuSavvy!\`);
                     input.value = '';
                     
                     // Auto-hide success message after 10 seconds
@@ -632,7 +715,7 @@ app.get('/reassign', (req, res) => {
                         status.style.display = 'none';
                     }, 10000);
                 } else {
-                    showStatus('error', \`❌ Error: \${data.error || 'Failed to reassign order'}\`);
+                    showStatus('error', \`❌ Error: \${data.error || 'Failed to reassign order'}. \${data.details || ''}\`);
                 }
             } catch (error) {
                 showStatus('error', \`❌ Network error: \${error.message}. Make sure the server is running!\`);
@@ -670,6 +753,7 @@ app.listen(PORT, () => {
   console.log(`✓ Shop: ${process.env.SHOPIFY_SHOP}`);
   console.log(`✓ Americana Warehouse: ${process.env.AMERICANA_WAREHOUSE_ID}`);
   console.log(`✓ Genesis Warehouse: ${process.env.GENESIS_WAREHOUSE_ID}`);
+  console.log(`✓ Genesis Location: ${process.env.GENESIS_LOCATION_ID}`);
   console.log(`✓ SkuSavvy Endpoint: ${process.env.SKUSAVVY_GRAPHQL_ENDPOINT}`);
   console.log('=================================\n');
 });
