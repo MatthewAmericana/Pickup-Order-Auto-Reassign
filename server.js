@@ -226,6 +226,118 @@ app.post('/webhooks/*', async (req, res) => {
 });
 
 /**
+ * Manual endpoint to reassign packed order back to Genesis for pickup
+ * Call this after packing at Americana to prepare for customer pickup
+ * 
+ * POST /api/reassign-to-genesis
+ * Body: { "orderNumber": "APA411542" } or { "orderId": "uuid-here" }
+ */
+app.post('/api/reassign-to-genesis', async (req, res) => {
+  try {
+    const body = JSON.parse(req.body.toString());
+    const { orderNumber, orderId } = body;
+
+    if (!orderNumber && !orderId) {
+      return res.status(400).json({ 
+        error: 'Missing orderNumber or orderId in request body' 
+      });
+    }
+
+    console.log('\n=================================');
+    console.log(`🔄 Reassigning to Genesis: ${orderNumber || orderId}`);
+    console.log('=================================');
+
+    let orderUUID;
+    let shipments;
+
+    // If we have order number, find the UUID first
+    if (orderNumber) {
+      const apaOrderNumber = orderNumber.replace('#', '');
+      console.log('🔍 Finding order in SkuSavvy...');
+      
+      const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
+        apaOrderNumber: apaOrderNumber
+      });
+
+      if (!result.orders || result.orders.length === 0) {
+        console.log('❌ Order not found');
+        return res.status(404).json({ error: 'Order not found in SkuSavvy' });
+      }
+
+      orderUUID = result.orders[0].id;
+      shipments = result.orders[0].shipments || [];
+    } else {
+      // We already have the UUID
+      orderUUID = orderId;
+      
+      // Get shipments
+      const result = await skuSavvyClient.request(FIND_ORDER_AND_SHIPMENTS_QUERY, {
+        apaOrderNumber: orderId
+      });
+
+      if (!result.orders || result.orders.length === 0) {
+        console.log('❌ Order not found');
+        return res.status(404).json({ error: 'Order not found in SkuSavvy' });
+      }
+
+      shipments = result.orders[0].shipments || [];
+    }
+
+    console.log(`✅ Found: ${shipments.length} shipment(s)`);
+
+    if (shipments.length === 0) {
+      console.log('⚠️  No shipments found');
+      return res.status(400).json({ error: 'No shipments to reassign' });
+    }
+
+    // Reassign each shipment to Genesis warehouse
+    const REASSIGN_TO_GENESIS_MUTATION = `
+      mutation ReassignAmericanaToGenesis($orderId: UUID!, $shipmentId: Int!) {
+        shipmentReassignLocation(
+          orderId: $orderId,
+          shipmentId: $shipmentId,
+          warehouseId: "${process.env.GENESIS_WAREHOUSE_ID}"
+        ) {
+          shipments { 
+            id
+          }
+        }
+      }
+    `;
+
+    let reassignedCount = 0;
+    
+    for (const shipment of shipments) {
+      try {
+        await skuSavvyClient.request(REASSIGN_TO_GENESIS_MUTATION, {
+          orderId: orderUUID,
+          shipmentId: parseInt(shipment.id),
+        });
+        reassignedCount++;
+      } catch (error) {
+        console.error(`❌ Shipment ${shipment.id} failed:`, error.message);
+      }
+    }
+
+    console.log(`🎉 SUCCESS: ${reassignedCount}/${shipments.length} shipment(s) reassigned Americana → Genesis`);
+    console.log('=================================\n');
+
+    res.status(200).json({ 
+      success: true,
+      message: 'Order reassigned to Genesis for pickup',
+      shipmentsReassigned: reassignedCount,
+      orderUUID: orderUUID
+    });
+
+  } catch (error) {
+    console.error('❌ Error:', error.message);
+    res.status(500).json({ 
+      error: error.message 
+    });
+  }
+});
+
+/**
  * Health check endpoint
  */
 app.get('/health', (req, res) => {
@@ -258,7 +370,8 @@ app.listen(PORT, () => {
   console.log(`✓ Server running on port ${PORT}`);
   console.log(`✓ Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`✓ Shop: ${process.env.SHOPIFY_SHOP}`);
-  console.log(`✓ Warehouse: ${process.env.AMERICANA_WAREHOUSE_ID}`);
+  console.log(`✓ Americana Warehouse: ${process.env.AMERICANA_WAREHOUSE_ID}`);
+  console.log(`✓ Genesis Warehouse: ${process.env.GENESIS_WAREHOUSE_ID}`);
   console.log(`✓ SkuSavvy Endpoint: ${process.env.SKUSAVVY_GRAPHQL_ENDPOINT}`);
   console.log('=================================\n');
 });
